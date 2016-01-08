@@ -142,40 +142,54 @@ func (indexer *Indexer) Lookup(
 	numDocs = 0
 
 	// 合并关键词和标签为搜索键
-	keywords := make([]string, len(tokens)+len(labels))
+	tokensLen := len(tokens)
+	labelsLen := len(labels)
+	keywordsLen := tokensLen + labelsLen
+	keywords := make([]string, keywordsLen)
 	copy(keywords, tokens)
-	copy(keywords[len(tokens):], labels)
+	copy(keywords[tokensLen:], labels)
 
 	indexer.tableLock.RLock()
 	defer indexer.tableLock.RUnlock()
-	table := make([]*KeywordIndices, len(keywords))
+	table := make([]*KeywordIndices, keywordsLen)
+
+	// 默认匹配的关键词数量就是当前总数量
+	foundLen := keywordsLen
 	for i, keyword := range keywords {
 		indices, found := indexer.tableLock.table[keyword]
-		if !found {
-			// 当反向索引表中无此搜索键时直接返回
-			return
-		} else {
+		if found {
 			// 否则加入反向表中
 			table[i] = indices
+		} else {
+			// 匹配的token数量减一
+			foundLen--
 		}
 	}
 
 	// 当没有找到时直接返回
-	if len(table) == 0 {
+	if foundLen == 0 {
 		return
 	}
 
+	foundTable := make([]*KeywordIndices, foundLen)
+
 	// 归并查找各个搜索键出现文档的交集
 	// 从后向前查保证先输出DocId较大文档
-	indexPointers := make([]int, len(table))
-	for iTable := 0; iTable < len(table); iTable++ {
-		indexPointers[iTable] = indexer.getIndexLength(table[iTable]) - 1
+	indexPointers := make([]int, foundLen)
+	iFound := 0
+	for iTable := 0; iTable < keywordsLen; iTable++ {
+		if table[iTable] != nil {
+			foundTable[iFound] = table[iTable]
+			indexPointers[iFound] = indexer.getIndexLength(table[iTable]) - 1
+			iFound++
+		}
+
 	}
 	// 平均文本关键词长度，用于计算BM25
 	avgDocLength := indexer.totalTokenLength / float32(indexer.numDocuments)
 	for ; indexPointers[0] >= 0; indexPointers[0]-- {
 		// 以第一个搜索键出现的文档作为基准，并遍历其他搜索键搜索同一文档
-		baseDocId := indexer.getDocId(table[0], indexPointers[0])
+		baseDocId := indexer.getDocId(foundTable[0], indexPointers[0])
 		if docIds != nil {
 			_, found := docIds[baseDocId]
 			if !found {
@@ -184,12 +198,12 @@ func (indexer *Indexer) Lookup(
 		}
 		iTable := 1
 		found := true
-		for ; iTable < len(table); iTable++ {
+		for ; iTable < foundLen; iTable++ {
 			// 二分法比简单的顺序归并效率高，也有更高效率的算法，
 			// 但顺序归并也许是更好的选择，考虑到将来需要用链表重新实现
 			// 以避免反向表添加新文档时的写锁。
 			// TODO: 进一步研究不同求交集算法的速度和可扩展性。
-			position, foundBaseDocId := indexer.searchIndex(table[iTable],
+			position, foundBaseDocId := indexer.searchIndex(foundTable[iTable],
 				0, indexPointers[iTable], baseDocId)
 			if foundBaseDocId {
 				indexPointers[iTable] = position
@@ -217,12 +231,12 @@ func (indexer *Indexer) Lookup(
 			if indexer.initOptions.IndexType == types.LocationsIndex {
 				// 计算有多少关键词是带有距离信息的
 				numTokensWithLocations := 0
-				for i, t := range table[:len(tokens)] {
+				for i, t := range foundLen {
 					if len(t.locations[indexPointers[i]]) > 0 {
 						numTokensWithLocations++
 					}
 				}
-				if numTokensWithLocations != len(tokens) {
+				if numTokensWithLocations != tokensLen {
 					if !countDocsOnly {
 						docs = append(docs, types.IndexedDocument{
 							DocId: baseDocId,
@@ -233,13 +247,13 @@ func (indexer *Indexer) Lookup(
 				}
 
 				// 计算搜索键在文档中的紧邻距离
-				tokenProximity, tokenLocations := computeTokenProximity(table[:len(tokens)], indexPointers, tokens)
+				tokenProximity, tokenLocations := computeTokenProximity(foundTable, indexPointers, tokens)
 				indexedDoc.TokenProximity = int32(tokenProximity)
 				indexedDoc.TokenSnippetLocations = tokenLocations
 
 				// 添加TokenLocations
-				indexedDoc.TokenLocations = make([][]int, len(tokens))
-				for i, t := range table[:len(tokens)] {
+				indexedDoc.TokenLocations = make([][]int, foundLen)
+				for i, t := range foundTable {
 					indexedDoc.TokenLocations[i] = t.locations[indexPointers[i]]
 				}
 			}
@@ -249,7 +263,7 @@ func (indexer *Indexer) Lookup(
 				indexer.initOptions.IndexType == types.FrequenciesIndex {
 				bm25 := float32(0)
 				d := indexer.docTokenLengths[baseDocId]
-				for i, t := range table[:len(tokens)] {
+				for i, t := range foundTable {
 					var frequency float32
 					if indexer.initOptions.IndexType == types.LocationsIndex {
 						frequency = float32(len(t.locations[indexPointers[i]]))
